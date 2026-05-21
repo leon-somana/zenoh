@@ -227,6 +227,19 @@ pub trait Storage: Send + Sync {
     /// on the administration space for this storage.
     fn get_admin_status(&self) -> JsonValue;
 
+    /// Whether this storage will ever accept a [`Storage::put`] or
+    /// [`Storage::delete`]. Storages whose backend rejects all writes
+    /// (e.g. a volume configured as read-only) should override this to
+    /// return `false`. `zenoh-plugin-storage-manager` reads this value
+    /// once at storage start; when `false`, it skips
+    /// `Session::declare_subscriber` for the storage entirely, so the
+    /// storage exists only to answer queries via its `declare_queryable`.
+    ///
+    /// Default `true` preserves existing behavior for every backend.
+    fn accepts_writes(&self) -> bool {
+        true
+    }
+
     /// Function called for each incoming data ([`Sample`](zenoh::sample::Sample)) to be stored in this storage.
     /// A key can be `None` if it matches the `strip_prefix` exactly.
     /// In order to avoid data loss, the storage must store the `value` and `timestamp` associated with the `None` key
