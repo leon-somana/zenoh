@@ -44,6 +44,15 @@ zenoh = { workspace = true, default-features = false, features = [
 ] }
 zenoh-config = { workspace = true }
 zenoh-util = { workspace = true }
+# SIGQUIT task-dump support (see src/main.rs). `libc` drives the async-
+# signal-safe self-pipe; tokio's `taskdump` feature + rt/time expose
+# Handle::dump/block_on + timeout (the feature also pulls `backtrace` to
+# symbolize the traces); `zenoh-runtime` exposes the runtime pool to
+# dump. The dump code is cfg-gated (tokio_unstable + Linux + supported
+# arch); builds without those cfgs simply don't reference these.
+libc = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "taskdump"] }
+zenoh-runtime = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true, features = ["default"] }

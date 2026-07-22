@@ -230,6 +230,18 @@ impl ZRuntimePool {
             })
             .handle()
     }
+
+    /// Handles of every runtime initialized so far, paired with their
+    /// [`ZRuntime`] name. A tokio task dump is per-runtime — there is no
+    /// single handle covering all pools — so dumping the whole router
+    /// (on `SIGQUIT`) must iterate these; never-initialized runtimes hold
+    /// no tasks and are skipped.
+    pub fn initialized_handles(&self) -> Vec<(ZRuntime, Handle)> {
+        self.0
+            .iter()
+            .filter_map(|(zrt, cell)| cell.get().map(|rt| (*zrt, rt.handle().clone())))
+            .collect()
+    }
 }
 
 // If there are any blocking tasks spawned by ZRuntimes, the function will block until they return.

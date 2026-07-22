@@ -96,7 +96,141 @@ fn main() {
         }
     };
 
+    wait_for_shutdown();
+}
+
+/// Park the main thread until the process is signalled to exit.
+///
+/// On Linux/{aarch64,x86,x86_64} built with `--cfg tokio_unstable` and
+/// tokio's `taskdump` feature, `SIGQUIT` (`kill -3`, the JVM/Go "dump all
+/// stacks" convention) triggers a tokio task dump of every initialized
+/// zenoh runtime to the log, then keeps parking. On any other build this
+/// is a plain park and `SIGQUIT` keeps its default (terminate) behaviour.
+#[cfg(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+fn wait_for_shutdown() {
+    taskdump::park_dumping_on_sigquit();
+}
+
+#[cfg(not(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+)))]
+fn wait_for_shutdown() {
     std::thread::park();
+}
+
+/// SIGQUIT-triggered tokio task dumping — see [`wait_for_shutdown`].
+#[cfg(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+mod taskdump {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::time::Duration;
+
+    /// Per-runtime dump budget. A CPU-wedged pool cannot be re-polled, so
+    /// its dump times out rather than hanging the handler.
+    const PER_RUNTIME_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Write end of the self-pipe the signal handler pokes. A signal
+    /// handler must be async-signal-safe, so it only `write()`s one byte;
+    /// the dump itself runs on the main thread reading the other end.
+    static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+    extern "C" fn handle_sigquit(_sig: libc::c_int) {
+        let fd = PIPE_WRITE_FD.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let byte = [0u8; 1];
+            // SAFETY: write() is async-signal-safe; a full/closed pipe just
+            // drops this wake-up, which is harmless.
+            unsafe { libc::write(fd, byte.as_ptr() as *const libc::c_void, 1) };
+        }
+    }
+
+    /// Install the `SIGQUIT` handler, then block the main thread forever,
+    /// dumping all initialized zenoh runtimes each time `SIGQUIT` arrives.
+    /// Replaces `std::thread::park()`; falls back to a plain park if the
+    /// pipe or handler cannot be installed.
+    pub fn park_dumping_on_sigquit() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe() fills a [c_int; 2]; the return value is checked.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            tracing::error!(
+                "taskdump: pipe() failed ({}); parking without SIGQUIT dumps",
+                std::io::Error::last_os_error()
+            );
+            std::thread::park();
+            return;
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        PIPE_WRITE_FD.store(write_fd, Ordering::Relaxed);
+
+        // SAFETY: zeroed sigaction with a simple handler and SA_RESTART.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handle_sigquit as usize;
+        action.sa_flags = libc::SA_RESTART;
+        if unsafe { libc::sigaction(libc::SIGQUIT, &action, std::ptr::null_mut()) } != 0 {
+            tracing::error!(
+                "taskdump: sigaction(SIGQUIT) failed ({}); parking without SIGQUIT dumps",
+                std::io::Error::last_os_error()
+            );
+            std::thread::park();
+            return;
+        }
+        tracing::info!(
+            "taskdump: SIGQUIT handler installed; `kill -QUIT` dumps all tokio task traces"
+        );
+
+        let mut buf = [0u8; 1];
+        loop {
+            // SAFETY: blocking read of one byte into a stack buffer.
+            let n =
+                unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                dump_all_runtimes();
+            } else if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                tracing::error!("taskdump: self-pipe read failed ({err}); parking");
+                std::thread::park();
+                return;
+            }
+        }
+    }
+
+    fn dump_all_runtimes() {
+        let handles = zenoh_runtime::ZRUNTIME_POOL.initialized_handles();
+        tracing::warn!(
+            "SIGQUIT: dumping tokio task traces for {} initialized runtime(s)",
+            handles.len()
+        );
+        for (zrt, handle) in handles {
+            let dump_handle = handle.clone();
+            // The main thread is outside every runtime, so block_on is legal
+            // here; the timeout bounds a wedged pool.
+            let dumped = handle.block_on(async move {
+                tokio::time::timeout(PER_RUNTIME_DUMP_TIMEOUT, dump_handle.dump()).await
+            });
+            match dumped {
+                Ok(dump) => {
+                    for (i, task) in dump.tasks().iter().enumerate() {
+                        tracing::warn!("runtime {zrt} task {i}:\n{}", task.trace());
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    "runtime {zrt}: task dump timed out after {PER_RUNTIME_DUMP_TIMEOUT:?}; pool likely wedged"
+                ),
+            }
+        }
+    }
 }
 
 fn config_from_args(args: &Args) -> Config {
