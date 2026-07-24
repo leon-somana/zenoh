@@ -207,26 +207,44 @@ mod taskdump {
     }
 
     fn dump_all_runtimes() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
         let handles = zenoh_runtime::ZRUNTIME_POOL.initialized_handles();
         tracing::warn!(
             "SIGQUIT: dumping tokio task traces for {} initialized runtime(s)",
             handles.len()
         );
+
+        // Bound each dump from OUTSIDE its runtime. `Handle::dump()` does not resolve
+        // while a runtime worker is blocked, and an in-runtime `timeout` can't rescue
+        // it — the wedged runtime's timer never advances to fire that timeout, so the
+        // dump hangs (an observed production wedge truncated exactly the stuck pool).
+        // So drive each dump on a throwaway thread and bound it with a wall-clock
+        // `recv_timeout` on this thread. Threads run concurrently against one shared
+        // deadline, so total time is ~a single PER_RUNTIME_DUMP_TIMEOUT (not the sum)
+        // — within the watchdog's pre-SIGABRT grace. A timed-out dump thread is
+        // abandoned; the process is about to abort anyway.
+        let deadline = Instant::now() + PER_RUNTIME_DUMP_TIMEOUT;
+        let mut pending = Vec::with_capacity(handles.len());
         for (zrt, handle) in handles {
-            let dump_handle = handle.clone();
-            // The main thread is outside every runtime, so block_on is legal
-            // here; the timeout bounds a wedged pool.
-            let dumped = handle.block_on(async move {
-                tokio::time::timeout(PER_RUNTIME_DUMP_TIMEOUT, dump_handle.dump()).await
+            let (tx, rx) = mpsc::channel();
+            let driver = handle.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(driver.block_on(handle.dump()));
             });
-            match dumped {
+            pending.push((zrt, rx));
+        }
+        for (zrt, rx) in pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
                 Ok(dump) => {
                     for (i, task) in dump.tasks().iter().enumerate() {
                         tracing::warn!("runtime {zrt} task {i}:\n{}", task.trace());
                     }
                 }
                 Err(_) => tracing::warn!(
-                    "runtime {zrt}: task dump timed out after {PER_RUNTIME_DUMP_TIMEOUT:?}; pool likely wedged"
+                    "runtime {zrt}: task dump did not complete within {PER_RUNTIME_DUMP_TIMEOUT:?}; pool likely wedged"
                 ),
             }
         }
