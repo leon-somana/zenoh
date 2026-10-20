@@ -338,25 +338,31 @@ impl HatQueriesTrait for Hat {
     ) {
         debug_assert!(self.owns(ctx.src_face));
 
-        {
-            let res = get_mut_unchecked(&mut res);
-            match res.face_ctxs.get_mut(&ctx.src_face.id) {
-                Some(ctx) => {
-                    get_mut_unchecked(ctx).qabl = Some(*info);
-                }
-                None => {
-                    let ctx = res
-                        .face_ctxs
-                        .entry(ctx.src_face.id)
-                        .or_insert_with(|| Arc::new(FaceContext::new(ctx.src_face.clone())));
-                    get_mut_unchecked(ctx).qabl = Some(*info);
-                }
-            }
-        }
-
         self.face_hat_mut(ctx.src_face)
             .remote_qabls
             .insert(id, (res.clone(), *info));
+
+        // Recompute the aggregate qabl info for this face on this resource
+        // from all of the face's queryables on it. Mirrors the merge logic
+        // in unregister_queryable so that declaring a second queryable on
+        // the same resource doesn't silently overwrite the first's info
+        // (e.g. a later complete=false declaration would otherwise mask
+        // an earlier complete=true).
+        let new_face_info = self
+            .face_hat(ctx.src_face)
+            .remote_qabls
+            .values()
+            .filter_map(|(r, i)| (r == &res).then_some(*i))
+            .reduce(merge_qabl_infos);
+
+        {
+            let res = get_mut_unchecked(&mut res);
+            let face_ctx = res
+                .face_ctxs
+                .entry(ctx.src_face.id)
+                .or_insert_with(|| Arc::new(FaceContext::new(ctx.src_face.clone())));
+            get_mut_unchecked(face_ctx).qabl = new_face_info;
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(ctx, id, _res, _node_id), ret)]
