@@ -138,13 +138,33 @@ impl StorageService {
 
         let storage_key_expr = &self.configuration.key_expr;
 
-        // subscribe on key_expr
-        let storage_sub = match self.session.declare_subscriber(storage_key_expr).await {
-            Ok(storage_sub) => storage_sub,
-            Err(e) => {
-                tracing::error!("Error starting storage '{}': {}", self.name, e);
-                return;
+        // Read-only storages (whose backend reports
+        // `Storage::accepts_writes() == false`) get no `storage_sub`: every
+        // sample arriving at them would be rejected by `Storage::put`
+        // anyway. Without this gate, the per-sample work the dispatch
+        // task does to call the backend's put (and, for `History::Latest`
+        // backends, the `guard_cache_if_latest` round-trip that precedes
+        // it) runs for nothing. Worse, the bounded `FifoChannel` default
+        // subscriber handler back-pressures the router's fan-out when a
+        // slow read-only backend (e.g. a cloud-storage-backed mirror)
+        // co-subscribes the same `key_expr` as a fast writable primary,
+        // capping the primary's PUT throughput at the slow backend's
+        // serial drain rate.
+        let accepts_writes = self.storage.lock().await.accepts_writes();
+        let storage_sub = if accepts_writes {
+            match self.session.declare_subscriber(storage_key_expr).await {
+                Ok(sub) => Some(sub),
+                Err(e) => {
+                    tracing::error!("Error starting storage '{}': {}", self.name, e);
+                    return;
+                }
             }
+        } else {
+            tracing::debug!(
+                "Storage '{}' rejects writes — skipping subscriber declaration, serving queries only.",
+                self.name
+            );
+            None
         };
 
         // answer to queries on key_expr
@@ -168,41 +188,66 @@ impl StorageService {
         );
 
         tokio::task::spawn(async move {
-            loop {
-                tokio::select!(
-                    // on sample for key_expr
-                    sample = storage_sub.recv_async() => {
-                        let sample = match sample {
-                            Ok(sample) => sample,
-                            Err(e) => {
-                                tracing::error!("Error in sample: {}", e);
-                                continue;
+            // Two loop shapes: one with the sample arm (writable storages)
+            // and one without (read-only). Splitting at this level avoids
+            // hand-rolling an Option-typed never-resolving future for the
+            // disabled arm — the read-only path becomes self-evidently
+            // free of any sample-processing work, including the
+            // channel-receive itself.
+            if let Some(storage_sub) = storage_sub {
+                loop {
+                    tokio::select!(
+                        sample = storage_sub.recv_async() => {
+                            let sample = match sample {
+                                Ok(sample) => sample,
+                                Err(e) => {
+                                    tracing::error!("Error in sample: {}", e);
+                                    continue;
+                                }
+                            };
+                            let timestamp = sample.timestamp().cloned().unwrap_or(self.session.new_timestamp());
+                            let sample = SampleBuilder::from(sample).timestamp(timestamp).into();
+                            if let Err(e) = self.process_sample(sample).await {
+                                tracing::error!("{e:?}");
                             }
-                        };
-                        let timestamp = sample.timestamp().cloned().unwrap_or(self.session.new_timestamp());
-                        let sample = SampleBuilder::from(sample).timestamp(timestamp).into();
-                        if let Err(e) = self.process_sample(sample).await {
-                            tracing::error!("{e:?}");
-                        }
-                    },
-                    // on query on key_expr
-                    query = storage_queryable.recv_async() => {
-                        self.reply_query(query).await;
-                    },
-                    // on storage handle drop
-                    Ok(message) = rx.recv() => {
-                        match message {
-                            StorageMessage::Stop => {
-                                tracing::trace!("Dropping storage '{}'", self.name);
-                                return
-                            },
-                            StorageMessage::GetStatus(tx) => {
-                                let storage = self.storage.lock().await;
-                                std::mem::drop(tx.send(storage.get_admin_status().into()).await);
-                            }
-                        };
-                    },
-                );
+                        },
+                        query = storage_queryable.recv_async() => {
+                            self.reply_query(query).await;
+                        },
+                        Ok(message) = rx.recv() => {
+                            match message {
+                                StorageMessage::Stop => {
+                                    tracing::trace!("Dropping storage '{}'", self.name);
+                                    return
+                                },
+                                StorageMessage::GetStatus(tx) => {
+                                    let storage = self.storage.lock().await;
+                                    std::mem::drop(tx.send(storage.get_admin_status().into()).await);
+                                }
+                            };
+                        },
+                    );
+                }
+            } else {
+                loop {
+                    tokio::select!(
+                        query = storage_queryable.recv_async() => {
+                            self.reply_query(query).await;
+                        },
+                        Ok(message) = rx.recv() => {
+                            match message {
+                                StorageMessage::Stop => {
+                                    tracing::trace!("Dropping read-only storage '{}'", self.name);
+                                    return
+                                },
+                                StorageMessage::GetStatus(tx) => {
+                                    let storage = self.storage.lock().await;
+                                    std::mem::drop(tx.send(storage.get_admin_status().into()).await);
+                                }
+                            };
+                        },
+                    );
+                }
             }
         });
     }

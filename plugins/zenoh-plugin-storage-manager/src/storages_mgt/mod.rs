@@ -91,6 +91,14 @@ pub(crate) async fn create_and_start_storage(
                 History::Latest
             );
         }
+        if !storage.accepts_writes() {
+            bail!(
+                "Replication was enabled for storage {name} but the storage does not accept \
+                 writes (`Storage::accepts_writes` returned false). Anti-entropy alignment \
+                 writes to the storage during catch-up — it must be writable. Disable \
+                 replication on this storage or make the backend writable."
+            );
+        }
         let mut log_latest = LogLatest::new(
             config.key_expr.clone(),
             config.strip_prefix.clone(),
