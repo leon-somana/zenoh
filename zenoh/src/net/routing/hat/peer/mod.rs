@@ -53,7 +53,7 @@ use crate::net::{
     protocol::{
         gossip::Gossip,
         linkstate::{LinkState, LinkStateList},
-        network::Network,
+        network::{LinkId, Network},
     },
     routing::{
         dispatcher::{
@@ -288,7 +288,8 @@ impl HatBaseTrait for Hat {
         debug_assert!(self.owns(ctx.src_face));
 
         if let Some(net) = self.net_mut() {
-            net.add_link(transport.clone(), ctx.src_face.remote_bound);
+            let link_id = net.add_link(transport.clone(), ctx.src_face.remote_bound);
+            self.face_hat_mut(ctx.src_face).link_id = link_id;
         }
 
         // NOTE(regions): we only send/recv initial interests between peers that are mutually north-bound,
@@ -348,8 +349,9 @@ impl HatBaseTrait for Hat {
         hat_face.local_qabls.clear();
         hat_face.local_tokens.clear();
 
+        let link_id = hat_face.link_id;
         if let Some(net) = self.net_mut() {
-            net.remove_link(&face.zid);
+            net.remove_link(&face.zid, link_id);
         }
     }
 
@@ -367,6 +369,7 @@ impl HatBaseTrait for Hat {
             );
 
             if let ZExtBody::ZBuf(buf) = mem::take(&mut oam.body) {
+                let link_id = self.face_hat(ctx.src_face).link_id;
                 if let Some(net) = self.net_mut() {
                     use zenoh_buffers::reader::HasReader;
                     use zenoh_codec::RCodec;
@@ -378,7 +381,12 @@ impl HatBaseTrait for Hat {
 
                     tracing::trace!(linkstate = ?list);
 
-                    net.link_states(list.link_states, ctx.src_face.zid, ctx.src_face.whatami);
+                    net.link_states(
+                        list.link_states,
+                        ctx.src_face.zid,
+                        ctx.src_face.whatami,
+                        link_id,
+                    );
                 }
             }
         }
@@ -487,6 +495,7 @@ impl HatContext {
 }
 
 struct HatFace {
+    link_id: LinkId,
     next_id: AtomicU32, // @TODO: manage rollover and uniqueness
     remote_interests: HashMap<InterestId, RemoteInterest>,
     local_subs: LocalSubscribers,
@@ -500,6 +509,7 @@ struct HatFace {
 impl HatFace {
     fn new() -> Self {
         Self {
+            link_id: LinkId::default(),
             next_id: AtomicU32::new(1), // In p2p, id 0 is erserved for initial interest
             remote_interests: HashMap::new(),
             local_subs: LocalSubscribers::new(),
@@ -606,10 +616,14 @@ impl NetMut<'_> {
         }
     }
 
-    pub(crate) fn remove_link(self, zid: &ZenohIdProto) -> Vec<(NodeIndex, ZenohIdProto)> {
+    pub(crate) fn remove_link(
+        self,
+        zid: &ZenohIdProto,
+        link_id: LinkId,
+    ) -> Vec<(NodeIndex, ZenohIdProto)> {
         match self {
             Self::Gossip(n) => n.remove_link(zid),
-            Self::Network(n) => n.remove_link(zid),
+            Self::Network(n) => n.remove_link(zid, link_id),
         }
     }
 
@@ -618,13 +632,14 @@ impl NetMut<'_> {
         link_states: Vec<LinkState>,
         src: ZenohIdProto,
         src_whatami: WhatAmI,
+        src_link_id: LinkId,
     ) {
         match self {
             Self::Gossip(n) => {
                 n.link_states(link_states, src, src_whatami);
             }
             Self::Network(n) => {
-                n.link_states(link_states, src);
+                n.link_states(link_states, src, src_link_id);
             }
         }
     }

@@ -139,7 +139,8 @@ pub(crate) struct Network {
     pub(crate) gossip_target: WhatAmIMatcher,
     pub(crate) autoconnect: AutoConnect,
     pub(crate) idx: NodeIndex,
-    pub(crate) links: VecMap<Link>,
+    pub(crate) links: HashMap<LinkId, Link>,
+    next_link_id: LinkId,
     /// Map from [`NodeId`]s to the spanning tree rooted at the input [`NodeId`].
     pub(crate) trees: Vec<Tree>,
     pub(crate) distances: Vec<f64>,
@@ -181,7 +182,8 @@ impl Network {
             gossip_target,
             autoconnect,
             idx,
-            links: VecMap::new(),
+            links: HashMap::new(),
+            next_link_id: 0,
             trees: vec![Tree {
                 parent: None,
                 children: vec![],
@@ -265,12 +267,7 @@ impl Network {
 
     #[inline]
     pub(crate) fn get_link(&self, id: usize) -> Option<&Link> {
-        self.links.get(id)
-    }
-
-    #[inline]
-    pub(crate) fn get_link_from_zid(&self, zid: &ZenohIdProto) -> Option<&Link> {
-        self.links.values().find(|link| link.zid == *zid)
+        self.links.get(&id)
     }
 
     #[inline]
@@ -463,18 +460,19 @@ impl Network {
         &mut self,
         link_states: Vec<LinkState>,
         src: ZenohIdProto,
+        src_link_id: LinkId,
     ) -> Vec<LocalLinkState> {
         let links = &mut self.links;
         let graph = &self.graph;
 
-        // get src link to recover psid<->zid mappings
-        let src_link = match links.values_mut().find(|link| link.zid == src) {
+        let src_link = match links.get_mut(&src_link_id).filter(|link| link.zid == src) {
             Some(link) => link,
             None => {
                 tracing::error!(
-                    "{} Received LinkStateList from unknown link {}",
+                    "{} Received LinkStateList from unknown link {} ({})",
                     self.name,
-                    src
+                    src,
+                    src_link_id
                 );
                 return Vec::default();
             }
@@ -523,7 +521,7 @@ impl Network {
             .collect::<Vec<_>>();
 
         // apply psid<->zid mapping to links
-        let src_link = self.get_link_from_zid(&src).unwrap();
+        let src_link = &self.links[&src_link_id];
 
         link_states
             .into_iter()
@@ -561,6 +559,55 @@ impl Network {
                 }
             })
             .collect::<Vec<_>>()
+    }
+
+    fn reject_local_link_states(
+        &mut self,
+        link_states: Vec<LocalLinkState>,
+    ) -> Vec<LocalLinkState> {
+        let (local, remote): (Vec<_>, Vec<_>) = link_states
+            .into_iter()
+            .partition(|ls| ls.zid == self.graph[self.idx].zid);
+        if !(self.full_linkstate || self.gossip_multihop) {
+            return remote;
+        }
+        let own = &self.graph[self.idx];
+        let Some(newest) = local
+            .iter()
+            .filter(|ls| ls.sn > own.sn || (ls.sn == own.sn && ls.links != own.links))
+            .map(|ls| ls.sn)
+            .max()
+        else {
+            return remote;
+        };
+        let Some(sn) = newest.checked_add(1) else {
+            tracing::error!(
+                "{} Received a link state for the local node with sn {} and cannot advertise above it",
+                self.name,
+                newest
+            );
+            return remote;
+        };
+        tracing::warn!(
+            "{} Received a conflicting link state for the local node (sn {} vs {}): re-advertising local links with sn {}",
+            self.name,
+            newest,
+            own.sn,
+            sn
+        );
+        self.graph[self.idx].sn = sn;
+        self.send_on_links(
+            vec![(
+                self.idx,
+                Details {
+                    zid: true,
+                    links: true,
+                    ..Default::default()
+                },
+            )],
+            |_| true,
+        );
+        remote
     }
 
     fn process_singlehop_gossip_linkstate(&mut self, link_states: Vec<LocalLinkState>) -> Changes {
@@ -697,10 +744,12 @@ impl Network {
         &mut self,
         link_states: Vec<LinkState>,
         src: ZenohIdProto,
+        src_link_id: LinkId,
     ) -> Changes {
         tracing::trace!("{} Received from {} raw: {:?}", self.name, src, link_states);
 
-        let link_states = self.convert_to_local_link_states(link_states, src);
+        let link_states = self.convert_to_local_link_states(link_states, src, src_link_id);
+        let link_states = self.reject_local_link_states(link_states);
 
         for link_state in &link_states {
             tracing::trace!(
@@ -828,14 +877,9 @@ impl Network {
     }
 
     pub(crate) fn add_link(&mut self, transport: TransportUnicast) -> LinkId {
-        let free_index = {
-            let mut i = 0;
-            while self.links.contains_key(i) {
-                i += 1;
-            }
-            i
-        };
-        self.links.insert(free_index, Link::new(transport.clone()));
+        let link_id = self.next_link_id;
+        self.next_link_id += 1;
+        self.links.insert(link_id, Link::new(transport.clone()));
 
         let zid = transport.get_zid().unwrap();
         let whatami = transport.get_whatami().unwrap();
@@ -946,23 +990,52 @@ impl Network {
                 })
                 .collect();
         self.send_on_link(idxs, &transport);
-        free_index
+        link_id
     }
 
     pub(crate) fn find_disconnected_nodes_after_removing_link(
         &self,
         zid: &ZenohIdProto,
+        link_id: LinkId,
     ) -> Vec<(NodeIndex, ZenohIdProto)> {
-        if self.full_linkstate || self.gossip_multihop {
+        if self.has_other_link_to(zid, link_id) {
+            vec![]
+        } else if self.full_linkstate || self.gossip_multihop {
             self.disconnected_nodes_when_removing(Some(zid))
         } else {
             vec![]
         }
     }
 
-    pub(crate) fn remove_link(&mut self, zid: &ZenohIdProto) -> Vec<(NodeIndex, ZenohIdProto)> {
-        tracing::trace!("{} remove_link {}", self.name, zid);
-        self.links.retain(|_, link| link.zid != *zid);
+    fn has_other_link_to(&self, zid: &ZenohIdProto, link_id: LinkId) -> bool {
+        self.links
+            .iter()
+            .any(|(id, link)| *id != link_id && link.zid == *zid)
+    }
+
+    pub(crate) fn remove_link(
+        &mut self,
+        zid: &ZenohIdProto,
+        link_id: LinkId,
+    ) -> Vec<(NodeIndex, ZenohIdProto)> {
+        tracing::trace!("{} remove_link {} ({})", self.name, zid, link_id);
+        if !self
+            .links
+            .get(&link_id)
+            .is_some_and(|link| link.zid == *zid)
+        {
+            tracing::debug!(
+                "{} remove_link: link {} to {} is already gone",
+                self.name,
+                link_id,
+                zid
+            );
+            return vec![];
+        }
+        self.links.remove(&link_id);
+        if self.links.values().any(|link| link.zid == *zid) {
+            return vec![];
+        }
         self.graph[self.idx].links.retain(|dest, _| dest != zid);
 
         if self.full_linkstate || self.gossip_multihop {
@@ -1226,7 +1299,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         mem,
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
     use futures::executor::block_on;
@@ -1283,12 +1356,12 @@ mod tests {
             Bound::South,
         );
 
-        for p_zid in [p1_zid, p2_zid] {
+        let [p1_link, p2_link] = [p1_zid, p2_zid].map(|p_zid| {
             let (transport, transport_guard) =
                 mock_transport_unicast(p_zid, WhatAmI::Peer, Arc::new(|_| {}));
             mem::forget(transport_guard);
-            net.add_link(transport);
-        }
+            net.add_link(transport)
+        });
 
         net.link_states(
             vec![
@@ -1324,6 +1397,7 @@ mod tests {
                 },
             ],
             p1_zid,
+            p1_link,
         );
 
         net.link_states(
@@ -1360,6 +1434,7 @@ mod tests {
                 },
             ],
             p2_zid,
+            p2_link,
         );
 
         assert_eq!(
@@ -1393,6 +1468,273 @@ mod tests {
                 .count(),
             1,
             "b1's links info in a's graph should be non-empty"
+        );
+    }
+
+    fn router_network(zid: ZenohIdProto) -> Network {
+        Network::new(
+            "[Test]".to_string(),
+            zid,
+            minimal_runtime(),
+            /* full_linkstate */ true,
+            /* gossip */ false,
+            /* gossip_multihop */ false,
+            WhatAmIMatcher::empty(),
+            AutoConnect::disabled(),
+            HashMap::new(),
+            Bound::North,
+        )
+    }
+
+    fn router_link_state(
+        psid: u64,
+        sn: u64,
+        zid: Option<ZenohIdProto>,
+        links: Vec<u64>,
+    ) -> LinkState {
+        LinkState {
+            psid,
+            sn,
+            zid,
+            whatami: Some(WhatAmI::Router),
+            locators: None,
+            links,
+            link_weights: None,
+            is_gateway: false,
+        }
+    }
+
+    fn recording_transport(
+        zid: ZenohIdProto,
+    ) -> (
+        zenoh_transport::unicast::TransportUnicast,
+        Arc<Mutex<Vec<LinkState>>>,
+    ) {
+        use zenoh_buffers::reader::HasReader;
+        use zenoh_codec::RCodec;
+        use zenoh_protocol::{common::ZExtBody, network::NetworkBody};
+        use zenoh_transport::unicast::test_helpers::mock_transport_unicast;
+
+        use crate::net::{codec::Zenoh080Routing, protocol::linkstate::LinkStateList};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let (transport, transport_guard) = mock_transport_unicast(
+            zid,
+            WhatAmI::Router,
+            Arc::new(move |msg| {
+                if let NetworkBody::OAM(oam) = msg.body {
+                    if let ZExtBody::ZBuf(buf) = oam.body {
+                        let list: LinkStateList =
+                            Zenoh080Routing::new().read(&mut buf.reader()).unwrap();
+                        sink.lock().unwrap().extend(list.link_states);
+                    }
+                }
+            }),
+        );
+        mem::forget(transport_guard);
+        (transport, sent)
+    }
+
+    #[test]
+    fn test_link_state_about_local_router_is_rejected_and_corrected() {
+        let r_zid = "a0".parse::<ZenohIdProto>().unwrap();
+        let n1_zid = "a1".parse::<ZenohIdProto>().unwrap();
+        let n2_zid = "a2".parse::<ZenohIdProto>().unwrap();
+        let m_zid = "a3".parse::<ZenohIdProto>().unwrap();
+
+        let mut net = router_network(r_zid);
+        let (n1, n1_sent) = recording_transport(n1_zid);
+        let (n2, n2_sent) = recording_transport(n2_zid);
+        let n1_link = net.add_link(n1);
+        net.add_link(n2);
+        n1_sent.lock().unwrap().clear();
+        n2_sent.lock().unwrap().clear();
+
+        net.link_states(
+            vec![
+                router_link_state(0, 1, Some(n1_zid), vec![1]),
+                router_link_state(1, 100, Some(r_zid), vec![2]),
+                router_link_state(2, 1, Some(m_zid), vec![1]),
+            ],
+            n1_zid,
+            n1_link,
+        );
+
+        let own = &net.graph[net.idx];
+        assert_eq!(
+            own.links.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([n1_zid, n2_zid]),
+            "r's own links should still be its real neighbours"
+        );
+        assert!(
+            own.sn > 100,
+            "r should take a sequence number above the rejected claim"
+        );
+        for (peer, sent) in [("n1", &n1_sent), ("n2", &n2_sent)] {
+            let advertised = sent
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|ls| ls.zid == Some(r_zid))
+                .cloned()
+                .unwrap_or_else(|| panic!("r should re-advertise its own state to {peer}"));
+            assert_eq!(advertised.sn, own.sn);
+            assert_eq!(
+                advertised
+                    .links
+                    .iter()
+                    .map(|psid| net.graph[petgraph::graph::NodeIndex::new(*psid as usize)].zid)
+                    .collect::<HashSet<_>>(),
+                HashSet::from([n1_zid, n2_zid]),
+                "r should advertise its real neighbours to {peer}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_overlapping_connections_to_one_peer_stay_independent() {
+        let r_zid = "a0".parse::<ZenohIdProto>().unwrap();
+        let n_zid = "a1".parse::<ZenohIdProto>().unwrap();
+        let x_zid = "a2".parse::<ZenohIdProto>().unwrap();
+        let y_zid = "a3".parse::<ZenohIdProto>().unwrap();
+
+        let mut net = router_network(r_zid);
+        let (old, _) = recording_transport(n_zid);
+        let (new, _) = recording_transport(n_zid);
+        let old_link = net.add_link(old);
+        let new_link = net.add_link(new);
+
+        net.link_states(
+            vec![
+                router_link_state(0, 1, Some(n_zid), vec![1]),
+                router_link_state(1, 0, Some(r_zid), vec![]),
+                router_link_state(2, 1, Some(x_zid), vec![0]),
+            ],
+            n_zid,
+            old_link,
+        );
+        net.link_states(
+            vec![
+                router_link_state(0, 2, Some(n_zid), vec![1]),
+                router_link_state(1, 0, Some(r_zid), vec![]),
+                router_link_state(2, 1, Some(y_zid), vec![0]),
+            ],
+            n_zid,
+            new_link,
+        );
+        net.link_states(
+            vec![router_link_state(0, 3, None, vec![1, 2])],
+            n_zid,
+            new_link,
+        );
+
+        let n_links = |net: &Network| {
+            net.graph[net.get_idx(&n_zid).unwrap()]
+                .links
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(
+            n_links(&net),
+            HashSet::from([r_zid, y_zid]),
+            "n's state on the new connection should be decoded with that connection's mappings"
+        );
+
+        net.remove_link(&n_zid, old_link);
+
+        assert!(
+            net.graph[net.idx].links.contains_key(&n_zid),
+            "r should stay adjacent to n while the new connection is open"
+        );
+        assert!(net
+            .graph
+            .find_edge_undirected(net.idx, net.get_idx(&n_zid).unwrap())
+            .is_some());
+        net.link_states(
+            vec![router_link_state(0, 4, None, vec![1])],
+            n_zid,
+            new_link,
+        );
+        assert_eq!(
+            n_links(&net),
+            HashSet::from([r_zid]),
+            "link states on the new connection should still be applied after the old one closed"
+        );
+    }
+
+    #[test]
+    fn test_stale_close_leaves_replacement_connection() {
+        let r_zid = "a0".parse::<ZenohIdProto>().unwrap();
+        let n_zid = "a1".parse::<ZenohIdProto>().unwrap();
+
+        let mut net = router_network(r_zid);
+        let (old, _) = recording_transport(n_zid);
+        let old_link = net.add_link(old);
+        net.remove_link(&n_zid, old_link);
+        let (new, _) = recording_transport(n_zid);
+        let new_link = net.add_link(new);
+
+        net.remove_link(&n_zid, old_link);
+
+        assert!(
+            net.get_link(new_link).is_some(),
+            "closing the old connection again should not remove its replacement"
+        );
+        assert!(net.graph[net.idx].links.contains_key(&n_zid));
+    }
+
+    #[test]
+    fn test_stale_message_cannot_reach_replacement_connection() {
+        let r_zid = "a0".parse::<ZenohIdProto>().unwrap();
+        let n_zid = "a1".parse::<ZenohIdProto>().unwrap();
+        let x_zid = "a2".parse::<ZenohIdProto>().unwrap();
+        let y_zid = "a3".parse::<ZenohIdProto>().unwrap();
+
+        let mut net = router_network(r_zid);
+        let (old, _) = recording_transport(n_zid);
+        let old_link = net.add_link(old);
+        net.remove_link(&n_zid, old_link);
+        let (new, _) = recording_transport(n_zid);
+        let new_link = net.add_link(new);
+        net.link_states(
+            vec![
+                router_link_state(0, 1, Some(n_zid), vec![1]),
+                router_link_state(1, 0, Some(r_zid), vec![]),
+                router_link_state(2, 1, Some(y_zid), vec![0]),
+            ],
+            n_zid,
+            new_link,
+        );
+
+        net.link_states(
+            vec![
+                router_link_state(0, 2, Some(n_zid), vec![1]),
+                router_link_state(1, 0, Some(r_zid), vec![]),
+                router_link_state(2, 1, Some(x_zid), vec![0]),
+            ],
+            n_zid,
+            old_link,
+        );
+
+        assert!(
+            net.get_idx(&x_zid).is_none(),
+            "link states from the closed connection should not be applied"
+        );
+        net.link_states(
+            vec![router_link_state(0, 3, None, vec![1, 2])],
+            n_zid,
+            new_link,
+        );
+        assert_eq!(
+            net.graph[net.get_idx(&n_zid).unwrap()]
+                .links
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            HashSet::from([r_zid, y_zid]),
+            "the replacement's psid mappings should be unaffected by the stale message"
         );
     }
 }
