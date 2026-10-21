@@ -70,7 +70,9 @@ impl ClosableCallback {
     }
 
     pub(crate) fn close(&self) -> Option<&Arc<dyn TransportPeerEventHandler>> {
-        self.closed.store(true, Ordering::Relaxed);
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return None;
+        }
         self.callback.get()
     }
 }
@@ -96,6 +98,7 @@ pub(crate) struct TransportUnicastUniversal {
     pub(super) callback: Arc<ClosableCallback>,
     // Mutex for notification
     pub(super) status: Arc<AsyncMutex<TransportStatus>>,
+    teardown: Arc<AsyncMutex<()>>,
     // Transport statistics
     #[cfg(feature = "stats")]
     pub(super) stats: zenoh_stats::TransportStats,
@@ -139,6 +142,7 @@ impl TransportUnicastUniversal {
             links: Arc::new(RwLock::new(TransportLinks::default())),
             callback: Arc::new(ClosableCallback::new()),
             status: Arc::new(AsyncMutex::new(TransportStatus::Uninitialized)),
+            teardown: Arc::new(AsyncMutex::new(())),
             #[cfg(feature = "stats")]
             stats,
             #[cfg(feature = "shared-memory")]
@@ -158,9 +162,13 @@ impl TransportUnicastUniversal {
             self.config.zid
         );
 
+        let _teardown = self.teardown.lock().await;
         // Mark the transport as no longer alive and keep the lock
         // to avoid concurrent new_transport and closing/closed notifications
         let mut status_guard = self.get_status().await;
+        if matches!(*status_guard, TransportStatus::Closed) {
+            return Ok(());
+        }
         *status_guard = TransportStatus::Closed;
         let callback = self.callback.close();
 

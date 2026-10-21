@@ -979,3 +979,208 @@ impl TransportManager {
         self.state.unicast.authenticator.clone()
     }
 }
+
+#[cfg(all(test, feature = "transport_tcp"))]
+mod tests {
+    use std::{
+        any::Any,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use zenoh_link::{EndPoint, Link};
+    use zenoh_protocol::{
+        core::{WhatAmI, ZenohIdProto},
+        network::NetworkMessageMut,
+        transport::close,
+    };
+    use zenoh_result::ZResult;
+
+    use crate::{
+        multicast::TransportMulticast, unicast::TransportUnicast, TransportEventHandler,
+        TransportManager, TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler,
+    };
+
+    struct ClosedCounter(Arc<AtomicUsize>);
+
+    impl TransportPeerEventHandler for ClosedCounter {
+        fn handle_message(&self, _msg: NetworkMessageMut) -> ZResult<()> {
+            Ok(())
+        }
+        fn new_link(&self, _link: Link) {}
+        fn del_link(&self, _link: Link) {}
+        fn closed(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[derive(Default)]
+    struct PerTransportClosedCounts(Mutex<Vec<Arc<AtomicUsize>>>);
+
+    impl TransportEventHandler for PerTransportClosedCounts {
+        fn new_unicast(
+            &self,
+            _peer: TransportPeer,
+            _transport: TransportUnicast,
+        ) -> ZResult<Arc<dyn TransportPeerEventHandler>> {
+            let count = Arc::new(AtomicUsize::new(0));
+            self.0.lock().unwrap().push(count.clone());
+            Ok(Arc::new(ClosedCounter(count)))
+        }
+
+        fn new_multicast(
+            &self,
+            _transport: TransportMulticast,
+        ) -> ZResult<Arc<dyn TransportMulticastEventHandler>> {
+            unimplemented!()
+        }
+    }
+
+    fn manager(zid: u8, handler: Arc<dyn TransportEventHandler>) -> TransportManager {
+        TransportManager::builder()
+            .whatami(WhatAmI::Router)
+            .zid(ZenohIdProto::try_from([zid]).unwrap())
+            .unicast(TransportManager::config_unicast())
+            .build_test(handler)
+            .unwrap()
+    }
+
+    async fn wait_for_transport(
+        manager: &TransportManager,
+        peer: &ZenohIdProto,
+    ) -> Arc<dyn super::TransportUnicastTrait> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(t) = manager.state.unicast.transports.lock().await.get(peer) {
+                    break t.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transport should be registered")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_teardown_leaves_replacement_transport_registered() {
+        let counts = Arc::new(PerTransportClosedCounts::default());
+        let listener = manager(1, counts.clone());
+        let dialer = manager(2, Arc::new(PerTransportClosedCounts::default()));
+        let dialer_zid = dialer.zid();
+        let endpoint: EndPoint = format!("tcp/127.0.0.1:{}", zenoh_test::get_free_tcp_port())
+            .parse()
+            .unwrap();
+        listener.add_listener(endpoint.clone()).await.unwrap();
+
+        dialer
+            .open_transport_unicast(endpoint.clone())
+            .await
+            .unwrap();
+        let stale = wait_for_transport(&listener, &dialer_zid).await;
+        stale.close(close::reason::GENERIC).await.unwrap();
+
+        let replacement = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if dialer
+                    .open_transport_unicast(endpoint.clone())
+                    .await
+                    .is_ok()
+                {
+                    let t = wait_for_transport(&listener, &dialer_zid).await;
+                    if !Arc::ptr_eq(&t, &stale) {
+                        break t;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("dialer should reconnect");
+
+        stale.close(close::reason::GENERIC).await.unwrap();
+
+        let registered = listener
+            .state
+            .unicast
+            .transports
+            .lock()
+            .await
+            .get(&dialer_zid)
+            .cloned()
+            .expect("the replacement transport should stay registered");
+        assert!(Arc::ptr_eq(&registered, &replacement));
+        let closed: Vec<usize> = counts
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(
+            closed,
+            vec![1, 0],
+            "the stale transport should report closed once, the replacement never"
+        );
+
+        listener.close().await;
+        dialer.close().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_close_returns_only_after_teardown_completes() {
+        let counts = Arc::new(PerTransportClosedCounts::default());
+        let listener = manager(1, counts.clone());
+        let dialer = manager(2, Arc::new(PerTransportClosedCounts::default()));
+        let dialer_zid = dialer.zid();
+        let endpoint: EndPoint = format!("tcp/127.0.0.1:{}", zenoh_test::get_free_tcp_port())
+            .parse()
+            .unwrap();
+        listener.add_listener(endpoint.clone()).await.unwrap();
+        dialer.open_transport_unicast(endpoint).await.unwrap();
+        let transport = wait_for_transport(&listener, &dialer_zid).await;
+
+        let registry = listener.state.unicast.transports.lock().await;
+        let first = tokio::spawn({
+            let t = transport.clone();
+            async move { t.close(close::reason::GENERIC).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while counts.0.lock().unwrap()[0].load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first close should notify the routing layer");
+        let second = tokio::spawn({
+            let t = transport.clone();
+            async move { t.close(close::reason::GENERIC).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !second.is_finished(),
+            "a concurrent close should not return while the transport is still registered"
+        );
+
+        drop(registry);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(listener
+            .state
+            .unicast
+            .transports
+            .lock()
+            .await
+            .get(&dialer_zid)
+            .is_none());
+        assert_eq!(counts.0.lock().unwrap()[0].load(Ordering::SeqCst), 1);
+
+        listener.close().await;
+        dialer.close().await;
+    }
+}
