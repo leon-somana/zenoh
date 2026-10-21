@@ -96,7 +96,169 @@ fn main() {
         }
     };
 
+    #[cfg(all(feature = "systemd", target_os = "linux"))]
+    if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+        tracing::warn!("failed to notify systemd of readiness: {e}");
+    }
+
+    wait_for_shutdown();
+
+    tracing::info!("shutting down");
+    drop(_session);
+}
+
+#[cfg(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+fn wait_for_shutdown() {
+    taskdump::park_until_terminated();
+}
+
+#[cfg(not(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+)))]
+fn wait_for_shutdown() {
     std::thread::park();
+}
+
+#[cfg(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+mod taskdump {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::time::Duration;
+
+    const PER_RUNTIME_DUMP_TIMEOUT: Duration = Duration::from_secs(2);
+
+    static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+    const WOKE_BY_SIGQUIT: u8 = b'Q';
+    const WOKE_BY_SIGTERM: u8 = b'T';
+
+    extern "C" fn handle_sigquit(_sig: libc::c_int) {
+        wake(WOKE_BY_SIGQUIT);
+    }
+
+    extern "C" fn handle_sigterm(_sig: libc::c_int) {
+        wake(WOKE_BY_SIGTERM);
+    }
+
+    fn install(signal: libc::c_int, handler: extern "C" fn(libc::c_int)) -> bool {
+        // SAFETY: a zeroed sigaction with a plain handler and SA_RESTART.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler as usize;
+        action.sa_flags = libc::SA_RESTART;
+        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 }
+    }
+
+    fn install_default(signal: libc::c_int) {
+        // SAFETY: as above, with SIG_DFL in place of a handler.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = libc::SIG_DFL;
+        unsafe { libc::sigaction(signal, &action, std::ptr::null_mut()) };
+    }
+
+    fn wake(byte: u8) {
+        let fd = PIPE_WRITE_FD.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let buf = [byte; 1];
+            // SAFETY: write() is async-signal-safe; a full/closed pipe just
+            // drops this wake-up, which is harmless.
+            unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 1) };
+        }
+    }
+
+    pub fn park_until_terminated() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe() fills a [c_int; 2]; the return value is checked.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            tracing::error!(
+                "taskdump: pipe() failed ({}); parking without SIGQUIT dumps",
+                std::io::Error::last_os_error()
+            );
+            std::thread::park();
+            return;
+        }
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        PIPE_WRITE_FD.store(write_fd, Ordering::Relaxed);
+
+        if !install(libc::SIGQUIT, handle_sigquit) || !install(libc::SIGTERM, handle_sigterm) {
+            tracing::error!(
+                "signals: sigaction failed ({}); parking with default signal behaviour",
+                std::io::Error::last_os_error()
+            );
+            std::thread::park();
+            return;
+        }
+        tracing::info!(
+            "signals: SIGQUIT dumps all tokio task traces; SIGTERM shuts down gracefully"
+        );
+
+        let mut buf = [0u8; 1];
+        loop {
+            // SAFETY: blocking read of one byte into a stack buffer.
+            let n =
+                unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                if buf[0] == WOKE_BY_SIGTERM {
+                    install_default(libc::SIGTERM);
+                    install_default(libc::SIGQUIT);
+                    tracing::info!("signals: SIGTERM received; unwinding for a graceful stop");
+                    return;
+                }
+                dump_all_runtimes();
+            } else if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                tracing::error!("taskdump: self-pipe read failed ({err}); parking");
+                std::thread::park();
+                return;
+            }
+        }
+    }
+
+    fn dump_all_runtimes() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let handles = zenoh_runtime::ZRUNTIME_POOL.initialized_handles();
+        tracing::warn!(
+            "SIGQUIT: dumping tokio task traces for {} initialized runtime(s)",
+            handles.len()
+        );
+
+        let deadline = Instant::now() + PER_RUNTIME_DUMP_TIMEOUT;
+        let mut pending = Vec::with_capacity(handles.len());
+        for (zrt, handle) in handles {
+            let (tx, rx) = mpsc::channel();
+            let driver = handle.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(driver.block_on(handle.dump()));
+            });
+            pending.push((zrt, rx));
+        }
+        for (zrt, rx) in pending {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining) {
+                Ok(dump) => {
+                    for (i, task) in dump.tasks().iter().enumerate() {
+                        tracing::warn!("runtime {zrt} task {i}:\n{}", task.trace());
+                    }
+                }
+                Err(_) => tracing::warn!(
+                    "runtime {zrt}: task dump did not complete within {PER_RUNTIME_DUMP_TIMEOUT:?}; pool likely wedged"
+                ),
+            }
+        }
+    }
 }
 
 fn config_from_args(args: &Args) -> Config {

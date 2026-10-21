@@ -230,6 +230,13 @@ impl ZRuntimePool {
             })
             .handle()
     }
+
+    pub fn initialized_handles(&self) -> Vec<(ZRuntime, Handle)> {
+        self.0
+            .iter()
+            .filter_map(|(zrt, cell)| cell.get().map(|rt| (*zrt, rt.handle().clone())))
+            .collect()
+    }
 }
 
 // If there are any blocking tasks spawned by ZRuntimes, the function will block until they return.
