@@ -563,6 +563,55 @@ impl Network {
             .collect::<Vec<_>>()
     }
 
+    fn reject_local_link_states(
+        &mut self,
+        link_states: Vec<LocalLinkState>,
+    ) -> Vec<LocalLinkState> {
+        let (local, remote): (Vec<_>, Vec<_>) = link_states
+            .into_iter()
+            .partition(|ls| ls.zid == self.graph[self.idx].zid);
+        if !(self.full_linkstate || self.gossip_multihop) {
+            return remote;
+        }
+        let own = &self.graph[self.idx];
+        let Some(newest) = local
+            .iter()
+            .filter(|ls| ls.sn > own.sn || (ls.sn == own.sn && ls.links != own.links))
+            .map(|ls| ls.sn)
+            .max()
+        else {
+            return remote;
+        };
+        let Some(sn) = newest.checked_add(1) else {
+            tracing::error!(
+                "{} Received a link state for the local node with sn {} and cannot advertise above it",
+                self.name,
+                newest
+            );
+            return remote;
+        };
+        tracing::warn!(
+            "{} Received a conflicting link state for the local node (sn {} vs {}): re-advertising local links with sn {}",
+            self.name,
+            newest,
+            own.sn,
+            sn
+        );
+        self.graph[self.idx].sn = sn;
+        self.send_on_links(
+            vec![(
+                self.idx,
+                Details {
+                    zid: true,
+                    links: true,
+                    ..Default::default()
+                },
+            )],
+            |_| true,
+        );
+        remote
+    }
+
     fn process_singlehop_gossip_linkstate(&mut self, link_states: Vec<LocalLinkState>) -> Changes {
         let mut changes = Changes::default();
 
@@ -701,6 +750,7 @@ impl Network {
         tracing::trace!("{} Received from {} raw: {:?}", self.name, src, link_states);
 
         let link_states = self.convert_to_local_link_states(link_states, src);
+        let link_states = self.reject_local_link_states(link_states);
 
         for link_state in &link_states {
             tracing::trace!(
@@ -1226,7 +1276,7 @@ mod tests {
     use std::{
         collections::{HashMap, HashSet},
         mem,
-        sync::Arc,
+        sync::{Arc, Mutex},
     };
 
     use futures::executor::block_on;
@@ -1394,5 +1444,125 @@ mod tests {
             1,
             "b1's links info in a's graph should be non-empty"
         );
+    }
+
+    fn router_network(zid: ZenohIdProto) -> Network {
+        Network::new(
+            "[Test]".to_string(),
+            zid,
+            minimal_runtime(),
+            /* full_linkstate */ true,
+            /* gossip */ false,
+            /* gossip_multihop */ false,
+            WhatAmIMatcher::empty(),
+            AutoConnect::disabled(),
+            HashMap::new(),
+            Bound::North,
+        )
+    }
+
+    fn router_link_state(
+        psid: u64,
+        sn: u64,
+        zid: Option<ZenohIdProto>,
+        links: Vec<u64>,
+    ) -> LinkState {
+        LinkState {
+            psid,
+            sn,
+            zid,
+            whatami: Some(WhatAmI::Router),
+            locators: None,
+            links,
+            link_weights: None,
+            is_gateway: false,
+        }
+    }
+
+    fn recording_transport(
+        zid: ZenohIdProto,
+    ) -> (
+        zenoh_transport::unicast::TransportUnicast,
+        Arc<Mutex<Vec<LinkState>>>,
+    ) {
+        use zenoh_buffers::reader::HasReader;
+        use zenoh_codec::RCodec;
+        use zenoh_protocol::{common::ZExtBody, network::NetworkBody};
+        use zenoh_transport::unicast::test_helpers::mock_transport_unicast;
+
+        use crate::net::{codec::Zenoh080Routing, protocol::linkstate::LinkStateList};
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = sent.clone();
+        let (transport, transport_guard) = mock_transport_unicast(
+            zid,
+            WhatAmI::Router,
+            Arc::new(move |msg| {
+                if let NetworkBody::OAM(oam) = msg.body {
+                    if let ZExtBody::ZBuf(buf) = oam.body {
+                        let list: LinkStateList =
+                            Zenoh080Routing::new().read(&mut buf.reader()).unwrap();
+                        sink.lock().unwrap().extend(list.link_states);
+                    }
+                }
+            }),
+        );
+        mem::forget(transport_guard);
+        (transport, sent)
+    }
+
+    #[test]
+    fn test_link_state_about_local_router_is_rejected_and_corrected() {
+        let r_zid = "a0".parse::<ZenohIdProto>().unwrap();
+        let n1_zid = "a1".parse::<ZenohIdProto>().unwrap();
+        let n2_zid = "a2".parse::<ZenohIdProto>().unwrap();
+        let m_zid = "a3".parse::<ZenohIdProto>().unwrap();
+
+        let mut net = router_network(r_zid);
+        let (n1, n1_sent) = recording_transport(n1_zid);
+        let (n2, n2_sent) = recording_transport(n2_zid);
+        net.add_link(n1);
+        net.add_link(n2);
+        n1_sent.lock().unwrap().clear();
+        n2_sent.lock().unwrap().clear();
+
+        net.link_states(
+            vec![
+                router_link_state(0, 1, Some(n1_zid), vec![1]),
+                router_link_state(1, 100, Some(r_zid), vec![2]),
+                router_link_state(2, 1, Some(m_zid), vec![1]),
+            ],
+            n1_zid,
+        );
+
+        let own = &net.graph[net.idx];
+        assert_eq!(
+            own.links.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([n1_zid, n2_zid]),
+            "r's own links should still be its real neighbours"
+        );
+        assert!(
+            own.sn > 100,
+            "r should take a sequence number above the rejected claim"
+        );
+        for (peer, sent) in [("n1", &n1_sent), ("n2", &n2_sent)] {
+            let advertised = sent
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|ls| ls.zid == Some(r_zid))
+                .cloned()
+                .unwrap_or_else(|| panic!("r should re-advertise its own state to {peer}"));
+            assert_eq!(advertised.sn, own.sn);
+            assert_eq!(
+                advertised
+                    .links
+                    .iter()
+                    .map(|psid| net.graph[petgraph::graph::NodeIndex::new(*psid as usize)].zid)
+                    .collect::<HashSet<_>>(),
+                HashSet::from([n1_zid, n2_zid]),
+                "r should advertise its real neighbours to {peer}"
+            );
+        }
     }
 }
