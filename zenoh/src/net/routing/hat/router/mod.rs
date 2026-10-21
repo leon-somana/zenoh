@@ -363,7 +363,8 @@ impl HatBaseTrait for Hat {
     fn close_face(&mut self, ctx: DispatcherContext) {
         debug_assert!(self.owns(ctx.src_face));
 
-        self.net_mut().remove_link(&ctx.src_face.zid);
+        let link_id = self.face_hat(ctx.src_face).link_id;
+        self.net_mut().remove_link(&ctx.src_face.zid, link_id);
         self.compute_trees(ctx);
     }
 
@@ -391,9 +392,10 @@ impl HatBaseTrait for Hat {
 
                 tracing::trace!(linkstate = ?list);
 
+                let link_id = self.face_hat(ctx.src_face).link_id;
                 let removed_routers = self
                     .net_mut()
-                    .link_states(list.link_states, ctx.src_face.zid)
+                    .link_states(list.link_states, ctx.src_face.zid, link_id)
                     .removed_nodes
                     .into_iter()
                     .map(|(_, zid)| zid)
@@ -632,7 +634,10 @@ impl HatTrait for Hat {
         let removed_routers = self
             // NOTE: a &mut is not taken here and the link graph is not yet modified.
             .net()
-            .find_disconnected_nodes_after_removing_link(&ctx.src_face.zid)
+            .find_disconnected_nodes_after_removing_link(
+                &ctx.src_face.zid,
+                self.face_hat(ctx.src_face).link_id,
+            )
             .into_iter()
             .map(|(_, node)| node)
             .collect::<HashSet<_>>();
